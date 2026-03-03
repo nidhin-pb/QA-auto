@@ -1,0 +1,564 @@
+"""
+AI Brain v5 - Uses GPT-4o via Bytez SDK for intelligent chat.
+Model priority: openai/gpt-4o > openai/gpt-oss-20b > Qwen3-0.6B > templates
+"""
+import asyncio
+import re
+from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor
+from config import app_config
+from websocket_manager import ws_manager
+
+_executor = ThreadPoolExecutor(max_workers=2)
+
+
+class AIBrain:
+    def __init__(self):
+        self.bytez_keys = [app_config.ai.bytez_api_key, app_config.ai.bytez_api_key_2]
+        self.bytez_keys = [k for k in self.bytez_keys if k]  # remove blanks
+        self._api_tested = False
+        self._working_model = None  # Will store model name that works
+
+    def _model_ok_for_chat(self) -> bool:
+        return bool(self._working_model) and self._working_model.startswith("openai/")
+
+    async def _test_apis(self):
+        """Test which Bytez model works. Try GPT-4o first (best quality)."""
+        if self._api_tested:
+            return
+        self._api_tested = True
+
+        # Models to try in order of quality
+        models_to_try = [
+            "openai/gpt-4o",
+            "openai/gpt-oss-20b",
+            "Qwen/Qwen3-0.6B",
+            "inference-net/Schematron-3B",
+            "google/gemma-3-1b-it",
+        ]
+
+        for model_name in models_to_try:
+            try:
+                await ws_manager.send_log("info", f"Testing {model_name}...")
+                result = await self._call_bytez(
+                    model_name,
+                    "Reply with exactly: WORKING",
+                    system="You are a test. Reply with exactly one word: WORKING"
+                )
+
+                if result and len(result.strip()) > 0:
+                    # Check it's not just </think> tags
+                    cleaned = re.sub(r'</think>.*?</think>', '', result, flags=re.DOTALL).strip()
+                    if cleaned and len(cleaned) >= 2:
+                        self._working_model = model_name
+                        await ws_manager.send_log("info", f"✅ {model_name} is working! Response: {cleaned[:60]}")
+                        return
+                    else:
+                        await ws_manager.send_log("warning", f"{model_name} returned unusable response")
+                else:
+                    await ws_manager.send_log("warning", f"{model_name} returned empty response")
+
+            except Exception as e:
+                await ws_manager.send_log("warning", f"{model_name} failed: {str(e)[:80]}")
+
+        self._working_model = None
+        await ws_manager.send_log("warning", "⚠️ No AI model available - using smart templates")
+
+    async def _call_bytez(self, model_name: str, prompt: str, system: str = None) -> str:
+        """Call a model via Bytez SDK. Try each key until one works."""
+
+        def _run_with_key(key: str):
+            try:
+                from bytez import Bytez
+
+                sdk = Bytez(key)
+                model = sdk.model(model_name)
+
+                messages = []
+                if system:
+                    messages.append({"role": "system", "content": system})
+                messages.append({"role": "user", "content": prompt})
+
+                results = model.run(messages)
+
+                if results.error:
+                    return f"__ERROR__: {results.error}"
+
+                output = results.output
+                if output is None:
+                    return ""
+
+                # Parse output based on type
+                if isinstance(output, str):
+                    return output.strip()
+
+                if isinstance(output, list):
+                    if len(output) == 0:
+                        return ""
+                    # GPT-4o returns list of message dicts
+                    # Get the last assistant message
+                    for item in reversed(output):
+                        if isinstance(item, dict):
+                            if item.get("role") == "assistant":
+                                return str(item.get("content", "")).strip()
+                            if "content" in item:
+                                return str(item["content"]).strip()
+                            if "generated_text" in item:
+                                return str(item["generated_text"]).strip()
+                            if "text" in item:
+                                return str(item["text"]).strip()
+                    # If no assistant message found, try first dict
+                    first = output[0] if output else None
+                    if isinstance(first, dict):
+                        if "content" in first:
+                            return str(first["content"]).strip()
+                        if "generated_text" in first:
+                            return str(first["generated_text"]).strip()
+                        if "text" in first:
+                            return str(first["text"]).strip()
+
+                if isinstance(output, dict):
+                    if "content" in output:
+                        return str(output["content"]).strip()
+                    if "generated_text" in output:
+                        return str(output["generated_text"]).strip()
+                    if "text" in output:
+                        return str(output["text"]).strip()
+
+                return str(output).strip()
+
+            except Exception as e:
+                return f"__ERROR__: {str(e)}"
+
+        # Try each key until one works
+        for i, key in enumerate(self.bytez_keys):
+            if not key:
+                continue
+                
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(_executor, _run_with_key, key)
+            
+            if not result:
+                return ""
+                
+            if result.startswith("__ERROR__:"):
+                error_msg = result[10:].strip()
+                low = error_msg.lower()
+                if "min balance" in low or "credits" in low or "unauthorized" in low:
+                    # This key has credit issues, try next key
+                    if i < len(self.bytez_keys) - 1:
+                        await ws_manager.send_log("warning", f"Bytez key {i+1} failed ({model_name}): {error_msg[:80]}, trying next key...")
+                        continue
+                    else:
+                        # All keys failed, disable AI
+                        await ws_manager.send_log("warning", f"Bytez error ({model_name}): {error_msg[:160]}")
+                        self._working_model = None
+                        await ws_manager.send_log(
+                            "warning",
+                            "AI disabled for this run (Bytez credits/authorization issue). Falling back to templates."
+                        )
+                        return ""
+                else:
+                    # Other error, return it
+                    await ws_manager.send_log("warning", f"Bytez error ({model_name}): {error_msg[:160]}")
+                    return ""
+            
+            # Success - clean and return result
+            result = self._clean_response(result)
+            return result
+
+        # No keys available
+        return ""
+
+    def _clean_response(self, text: str) -> str:
+        """Clean AI response of artifacts."""
+        if not text:
+            return ""
+
+        # Remove </think>...</think> tags (Qwen models)
+        text = re.sub(r'</think>.*?</think>', '', text, flags=re.DOTALL)
+
+        # Remove markdown code blocks
+        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+
+        # Remove role prefixes
+        for prefix in ["Assistant:", "Employee:", "User:", "Reply:", "Response:",
+                       "Answer:", "Message:", "Bot:", "Human:"]:
+            if text.strip().startswith(prefix):
+                text = text.strip()[len(prefix):]
+
+        # Remove surrounding quotes
+        text = text.strip().strip('"\'').strip()
+
+        # Remove excessive whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        return text.strip()
+
+    async def generate_initial_message(self, scenario: dict) -> str:
+        """Generate first message. Use scenario default - they're good."""
+        await self._test_apis()
+
+        hint = scenario.get("initial_message", "")
+
+        # For most scenarios, hand-crafted initial message is perfect
+        # Only use AI to generate variations if we want diversity
+        if self._model_ok_for_chat() and hint:
+            try:
+                system = (
+                    "You are an employee chatting with an IT helpdesk bot in Microsoft Teams. "
+                    "Generate a natural chat message for the given scenario. "
+                    "Rules: Write ONLY the message. No quotes. No explanation. "
+                    "Be specific and natural. Under 50 words."
+                )
+                prompt = f"Write a message similar to this but slightly different: \"{hint}\""
+
+                result = await self._call_bytez(self._working_model, prompt, system)
+                if result and 5 < len(result) < 200:
+                    await ws_manager.send_log("info", f"🤖 AI initial: {result[:80]}")
+                    return result
+            except Exception:
+                pass
+
+        return hint if hint else f"I need help with {scenario.get('name', 'an IT issue')}"
+
+    async def generate_follow_up(self, scenario: dict, history: List[Dict],
+                                  cva_response: str, goal_status: str) -> str:
+        """
+        Generate a follow-up that ANSWERS CVA's questions.
+        This is critical function - AI must read CVA's response
+        and reply appropriately, staying on the same topic.
+        """
+        await self._test_apis()
+
+        if self._working_model:
+            result = await self._ai_follow_up(scenario, history, cva_response)
+            if result:
+                # Verify it's not a duplicate
+                prev_msgs = [m["content"] for m in history if m["role"] == "user"]
+                if result not in prev_msgs:
+                    await ws_manager.send_log("info", f"🤖 AI follow-up: {result[:80]}")
+                    return result
+                else:
+                    await ws_manager.send_log("info", "AI generated duplicate, using template")
+
+        # Fallback to smart templates
+        return self._template_follow_up(scenario, history, cva_response)
+
+    async def _ai_follow_up(self, scenario: dict, history: List[Dict],
+                             cva_response: str) -> str:
+        """Use AI to generate a contextual follow-up."""
+
+        # Build conversation context (last few messages) with larger limits
+        conv_lines = []
+        for msg in history[-8:]:
+            role = "Employee" if msg["role"] == "user" else "IT Bot"
+
+            # Give more space to bot messages (they contain steps)
+            limit = 500 if msg["role"] == "user" else 1400
+            conv_lines.append(f"{role}: {msg['content'][:limit]}")
+
+        conv_text = "\n".join(conv_lines)
+
+        system = (
+            "You are an employee chatting with an IT helpdesk chatbot.\n"
+            "You must reply to bot's latest message naturally.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Read bot's message carefully\n"
+            "2. If it asks questions, ANSWER those specific questions\n"
+            "3. Do NOT change the topic\n"
+            "4. Do NOT repeat your previous messages\n"
+            "5. Be a regular employee, not technical\n"
+            "6. Write ONLY your reply - no quotes, no explanation\n"
+            "7. Keep it under 60 words\n"
+            "8. Do NOT claim the bot message was cut off / not visible unless the bot explicitly says it was cut off.\n"
+            "9. If troubleshooting didn't work and goal involves creating a ticket, ask to create a ticket after 2-3 failed attempts."
+        )
+
+        # IMPORTANT: increase bot message window (was 500)
+        bot_window = (cva_response or "")[:2500]
+
+        prompt = (
+            f"CONVERSATION CONTEXT:\n{conv_text}\n\n"
+            f"THE BOT JUST SAID:\n\"{bot_window}\"\n\n"
+            f"YOUR GOAL: {scenario.get('goal', 'Get help')}\n\n"
+            f"Write your reply as employee (answer any questions the bot asked):"
+        )
+
+        result = await self._call_bytez(self._working_model, prompt, system)
+        return result if result and len(result) > 3 else ""
+
+    async def _ai_follow_up(self, scenario: dict, history: List[Dict],
+                             cva_response: str) -> str:
+        """Use AI to generate a contextual follow-up."""
+
+        # Only allow AI follow-ups for high-quality OpenAI models
+        if not self._model_ok_for_chat():
+            return self._template_follow_up(scenario, history, cva_response)
+
+        # Build conversation context (last few messages) with larger limits
+        conv_lines = []
+        for msg in history[-8:]:
+            role = "Employee" if msg["role"] == "user" else "IT Bot"
+
+            # Give more space to bot messages (they contain steps)
+            limit = 500 if msg["role"] == "user" else 1400
+            conv_lines.append(f"{role}: {msg['content'][:limit]}")
+
+        conv_text = "\n".join(conv_lines)
+
+        system = (
+            "You are an employee chatting with an IT helpdesk chatbot.\n"
+            "You must reply to bot's latest message naturally.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Read bot's message carefully\n"
+            "2. If it asks questions, ANSWER those specific questions\n"
+            "3. Do NOT change the topic\n"
+            "4. Do NOT repeat your previous messages\n"
+            "5. Be a regular employee, not technical\n"
+            "6. Write ONLY your reply - no quotes, no explanation\n"
+            "7. Keep it under 60 words\n"
+            "8. Do NOT claim the bot message was cut off / not visible unless the bot explicitly says it was cut off.\n"
+            "9. If troubleshooting didn't work and goal involves creating a ticket, ask to create a ticket after 2-3 failed attempts."
+        )
+
+        # IMPORTANT: increase bot message window (was 500)
+        bot_window = (cva_response or "")[:2500]
+
+        prompt = (
+            f"CONVERSATION CONTEXT:\n{conv_text}\n\n"
+            f"THE BOT JUST SAID:\n\"{bot_window}\"\n\n"
+            f"YOUR GOAL: {scenario.get('goal', 'Get help')}\n\n"
+            f"Write your reply as employee (answer any questions the bot asked):"
+        )
+
+        result = await self._call_bytez(self._working_model, prompt, system)
+        return result if result and len(result) > 3 else ""
+
+    async def analyze_response(self, scenario: dict, cva_response: str,
+                                history: List[Dict]) -> dict:
+        """Analyze CVA's response. Uses pattern matching (fast and reliable)."""
+        cva = cva_response.lower()
+        goal = scenario.get("goal", "").lower()
+
+        has_error = any(w in cva for w in [
+            "sorry, i can't", "error occurred", "something went wrong"
+        ])
+        has_steps = any(w in cva for w in ["step", "try", "1.", "first", "check", "go to"])
+        has_ticket = any(w in cva for w in ["inc00", "ritm00", "incident number", "ticket has been"])
+        has_citation = any(w in cva for w in [".pdf", ".docx", "citation", "guide", "knowledge"])
+        has_catalog = any(w in cva for w in ["catalog", "complete this request"])
+
+        goal_achieved = False
+        if "troubleshoot" in goal and has_steps:
+            goal_achieved = True
+        if "create" in goal and has_ticket:
+            goal_achieved = True
+        if "catalog" in goal and has_catalog:
+            goal_achieved = True
+        if "list" in goal and has_ticket:
+            goal_achieved = True
+        if "retrieve" in goal and has_ticket:
+            goal_achieved = True
+        if "update" in goal and "updated" in cva:
+            goal_achieved = True
+        if "resolve" in goal and "resolved" in cva:
+            goal_achieved = True
+        if "close" in goal and "closed" in cva:
+            goal_achieved = True
+        if "agent" in goal and any(w in cva for w in ["agent", "handover"]):
+            goal_achieved = True
+        if "language" in goal and len(cva_response) > 20:
+            goal_achieved = True
+        if "handle" in goal and len(cva_response) > 20 and not has_error:
+            goal_achieved = True
+
+        should_continue = not goal_achieved and not has_error and len(history) < 12
+        if "?" in cva_response and not goal_achieved:
+            should_continue = True
+
+        return {
+            "is_relevant": len(cva_response) > 10,
+            "is_helpful": not has_error,
+            "has_follow_up": "?" in cva_response,
+            "has_citations": has_citation,
+            "has_ticket_info": has_ticket,
+            "has_error": has_error,
+            "goal_achieved": goal_achieved,
+            "should_continue": should_continue,
+            "quality_score": 8 if not has_error else 3,
+            "issues_found": [],
+            "notes": f"Model: {self._working_model or 'templates'}",
+        }
+
+    def _template_follow_up(self, scenario: dict, history: List[Dict],
+                             cva_response: str) -> str:
+        """Fallback templates when no AI is available."""
+        cva = cva_response.lower()
+        goal = scenario.get("goal", "").lower()
+        turn = len([m for m in history if m["role"] == "user"])
+
+        # Answer specific questions
+        if "changed your password" in cva:
+            return "No, I haven't changed my password recently. I've tried logging in about 5 times and kept getting an error."
+        if "account lock" in cva:
+            return "I think my account might be locked after too many failed attempts."
+        if "multiple devices" in cva or "more than one device" in cva:
+            return "No, I'm only using my work laptop to log in."
+        if "internet connection" in cva and "vpn" in goal:
+            return "Yes, my internet works fine. I can browse websites. Only VPN is failing."
+        if "retry" in cva and "vpn" in cva:
+            return "I just retried and still getting error 809."
+        if "hardware" in cva and "remove" in cva:
+            return "I haven't added any new hardware recently."
+        if "safe mode" in cva:
+            return "I tried Safe Mode but still getting the same error."
+        if "which system" in cva or "which application" in cva:
+            return "It's my Windows login on my Dell Latitude laptop."
+        if "error message" in cva or "what error" in cva:
+            return "The error says: Access Denied - Error code 0x80070005"
+        if "urgency" in cva or "priority" in cva:
+            return "High priority - I can't work without this fixed."
+
+        # Goal-based
+        if "ticket" in goal and turn >= 2:
+            if has_steps := any(w in cva for w in ["step", "try", "check"]):
+                return "I tried those steps but nothing worked. Please create a ticket for this."
+        if any(w in cva for w in ["created", "incident number", "inc00"]):
+            return "Thank you for creating the ticket!"
+        if "catalog" in cva or "complete this request" in cva:
+            return "I'd like to select the first option please."
+
+        # Generic
+        if "?" in cva_response:
+            return "Yes, I've tried that but the issue persists."
+        if turn <= 1:
+            return "I tried that but the issue is still there. What else can I try?"
+        if turn == 2:
+            return "Nothing worked. Can you create a ticket for the IT team to investigate?"
+        return "Thank you for your help."
+
+    async def judge_expected(self, user_query: str, cva_response: str, expected: str, action: str = "") -> dict:
+        """
+        LLM-as-judge for semantic match (Option A: only used when Expected Response is filled).
+        Returns: {matches: bool, relevance: 0-10, reason: str}
+        """
+        await self._test_apis()
+
+        # If no model available, be explicit (don't silently pass)
+        if not self._working_model:
+            return {
+                "matches": False,
+                "relevance": 0,
+                "reason": "No AI judge model available (Bytez). Cannot do semantic expected-response validation."
+            }
+
+        system = (
+            "You are a QA evaluator for an IT helpdesk chatbot. "
+            "Be FAIR and accept paraphrases. Do not require exact wording. "
+            "If the bot response satisfies the same intent as the expected response, mark matches=true. "
+            "Return ONLY valid JSON."
+        )
+
+        prompt = f"""
+USER QUERY:
+{user_query}
+
+EXPECTED RESPONSE (intent-level, paraphrase OK):
+{expected}
+
+BOT RESPONSE:
+{cva_response}
+
+ACTION CONTEXT (from Excel):
+{action}
+
+Return JSON exactly like:
+{{"matches": true/false, "relevance": 0-10, "reason": "short explanation"}}
+"""
+
+        txt = await self._call_bytez(self._working_model, prompt, system=system)
+        if not txt:
+            return {"matches": False, "relevance": 0, "reason": "Judge returned empty response."}
+
+        # Parse JSON from model output
+        import json
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        if not m:
+            return {"matches": False, "relevance": 0, "reason": f"Judge returned non-JSON: {txt[:200]}"}
+
+        try:
+            data = json.loads(m.group(0))
+            return {
+                "matches": bool(data.get("matches", False)),
+                "relevance": int(data.get("relevance", 0)),
+                "reason": str(data.get("reason", ""))[:600],
+            }
+        except Exception as e:
+            return {"matches": False, "relevance": 0, "reason": f"Failed to parse judge JSON: {str(e)} :: {txt[:200]}"}
+
+    async def judge_action(self, user_query: str, cva_response: str, action: str, links: list, source_kb: str = "", tool_calling: bool = False) -> dict:
+        """
+        Judge whether the bot fulfilled the Action requirement for this test case.
+        Returns JSON dict: {passed: bool, reason: str, score: 0-10, detected: {...}}
+        """
+        await self._test_apis()
+        if not self._working_model:
+            return {"passed": False, "score": 0, "reason": "No AI model available for action judging.", "detected": {}}
+
+        system = (
+            "You are a strict QA evaluator for a ServiceNow/IT helpdesk chatbot in Microsoft Teams. "
+            "Evaluate whether the bot response fulfills the required ACTION. "
+            "Use the provided LINKS as evidence. Return ONLY valid JSON."
+        )
+
+        prompt = f"""
+USER QUERY:
+{user_query}
+
+REQUIRED ACTION:
+{action}
+
+SOURCE KB (if any):
+{source_kb}
+
+TOOL CALLING REQUIRED (Y/N):
+{"Y" if tool_calling else "N"}
+
+BOT RESPONSE:
+{cva_response}
+
+CAPTURED LINKS:
+{links}
+
+Return JSON exactly like:
+{{
+  "passed": true/false,
+  "score": 0-10,
+  "reason": "short but specific",
+  "detected": {{
+     "has_steps": true/false,
+     "has_ticket_or_request": true/false,
+     "has_servicenow_link_or_text": true/false,
+     "kb_link_present": true/false,
+     "kb_matches_source": true/false
+  }}
+}}
+"""
+        txt = await self._call_bytez(self._working_model, prompt, system=system)
+        if not txt:
+            return {"passed": False, "score": 0, "reason": "Judge returned empty response.", "detected": {}}
+
+        import json, re
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        if not m:
+            return {"passed": False, "score": 0, "reason": f"Non-JSON judge output: {txt[:200]}", "detected": {}}
+
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {"passed": False, "score": 0, "reason": f"Failed to parse judge JSON: {txt[:200]}", "detected": {}}
+
+    async def close(self):
+        """Cleanup."""
+        pass

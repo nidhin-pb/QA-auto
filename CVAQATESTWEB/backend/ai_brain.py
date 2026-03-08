@@ -70,6 +70,9 @@ class AIBrain:
             "Qwen/Qwen3-0.6B",
         ]
 
+    def is_available(self):
+        return not self._ai_disabled and self._working_model is not None
+
     async def _test_apis(self):
         if self._api_tested:
             return
@@ -221,7 +224,7 @@ class AIBrain:
         await self._test_apis()
         hint = scenario.get("initial_message", "") or ""
 
-        if self._model_ok_for_initial_rewrite() and hint:
+        if self._model_ok_for_initial_rewrite() and hint and scenario.get("min_turns", 1) > 1:
             system = (
                 "Rewrite the message with the same meaning. "
                 "Return ONLY the rewritten message. Under 50 words."
@@ -238,8 +241,8 @@ class AIBrain:
         await self._test_apis()
 
         # Safe follow-up fallback when AI unavailable
-        if not self.ai_available:
-            await ws_manager.send_log("warning", "AI unavailable - using template follow-up")
+        if not self.is_available():
+            await ws_manager.send_log("warning", "AI unavailable — using template follow-up")
             return self._template_follow_up(scenario, history, cva_response)
 
         # If LLM available AND model is strong enough, try LLM follow-up
@@ -364,12 +367,8 @@ class AIBrain:
 
     async def judge_expected(self, user_query: str, cva_response: str, expected: str, action: str = "") -> dict:
         await self._test_apis()
-        if not self.ai_available:
-            return {
-                "matches": False,
-                "relevance": 0,
-                "reason": "AI unavailable - judge skipped"
-            }
+        if not self.is_available():
+            return {"matches": False, "relevance": 0, "reason": "AI unavailable — skipped"}
         if self._ai_disabled:
             return {"matches": False, "relevance": 0, "reason": "Judge unavailable (no working model)."}
 
@@ -413,11 +412,11 @@ Return JSON:
 
     async def judge_action(self, user_query: str, cva_response: str, action: str, links: list, source_kb: str = "", tool_calling: bool = False) -> dict:
         await self._test_apis()
-        if not self.ai_available:
+        if not self.is_available():
             return {
                 "passed": False, 
                 "score": 0, 
-                "reason": "AI unavailable - judge skipped", 
+                "reason": "AI unavailable — skipped", 
                 "detected": {}
             }
         if self._ai_disabled:

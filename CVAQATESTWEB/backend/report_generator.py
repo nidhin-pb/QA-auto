@@ -150,21 +150,29 @@ class ReportGenerator:
         ws = wb.create_sheet("QA Results (Compact)", 0)
 
         headers = [
-            "Test ID", "Status", "Priority",
-            "Client", "Module",
+            "Test ID",
+            "Status",
+            "Priority",
+            "Client",
+            "Module",
             "User Query",
-            "Action (Expected)",
-            "ToolCalling (Y/N)",
-            "Source KB (Expected)",
+            "Action",
+            "Tool Calling",
+            "Source KB",
             "Expected Response",
-            "Actual Reply (First)",
-            "Action Detected (Actual)",
-            "KB Links Found",
-            "Ticket/Request IDs Found",
+            "First Bot Reply",
+            "Action Detected",
+            "KB Links",
+            "Tickets",
             "Similarity",
             "Judge Matches",
             "Judge Relevance",
             "Judge Reason",
+            "AI Semantic Match",
+            "Semantic Confidence",
+            "AI Intent Match",
+            "Deterministic Validation Result",
+            "Lifecycle Status",
             "Top Bug / Failure Reason",
         ]
 
@@ -211,12 +219,38 @@ class ReportGenerator:
             ws.cell(row=row_idx, column=17, value=judge.get("relevance", ""))
             ws.cell(row=row_idx, column=18, value=(judge.get("reason", "") or "")[:1200])
 
-            ws.cell(row=row_idx, column=19, value=self._top_failure_reason(r))
+            # New semantic confidence and AI intent match columns
+            semantic_score = ""
+            semantic_match = ""
+            if getattr(r, "excel_expected_response", None):
+                judge = getattr(r, "expected_judge", None) or {}
+                semantic_score = judge.get("relevance", "")
+                semantic_match = judge.get("matches", "")
+
+            ws.cell(row=row_idx, column=19, value=semantic_match)  # AI Semantic Match
+            ws.cell(row=row_idx, column=20, value=semantic_score)  # Semantic Confidence
+            ws.cell(row=row_idx, column=21, value=semantic_score)  # AI Intent Match
+            ws.cell(row=row_idx, column=22, value=getattr(r, "status", ""))  # Deterministic Validation Result
+            
+            # Lifecycle status
+            state = getattr(r, "state", {})
+            lifecycle_status = []
+            if state.get("ticket_created"):
+                lifecycle_status.append("Created")
+            if state.get("ticket_updated"):
+                lifecycle_status.append("Updated")
+            if state.get("ticket_resolved"):
+                lifecycle_status.append("Resolved")
+            if state.get("ticket_closed"):
+                lifecycle_status.append("Closed")
+            
+            ws.cell(row=row_idx, column=23, value=", ".join(lifecycle_status) if lifecycle_status else "N/A")  # Lifecycle Status
+            ws.cell(row=row_idx, column=24, value=self._top_failure_reason(r))  # Top Bug / Failure Reason
 
             for col_idx in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
 
-        widths = [10, 10, 10, 14, 16, 42, 30, 14, 26, 40, 52, 28, 40, 22, 10, 12, 12, 45, 55]
+        widths = [10, 10, 10, 14, 16, 42, 30, 14, 26, 40, 52, 28, 40, 22, 10, 12, 12, 45, 12, 15, 15, 20, 15, 55]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
 

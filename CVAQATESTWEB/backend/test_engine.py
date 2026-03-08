@@ -30,7 +30,7 @@ from utils import (
     contains_service_catalog,
     has_kb_hyperlink,
 )
-
+from validators.validator_factory import ValidatorFactory
 
 class TestResult:
     def __init__(self, scenario: dict):
@@ -558,207 +558,49 @@ class TestEngine:
         result.duration = (result.end_time - result.start_time).total_seconds()
         return result
 
-    def _validate(self, result: TestResult, conversation: List[Dict]):
-        validations = result.scenario.get("validations", [])
-        all_cva = " ".join(m.get("content", "") for m in conversation if m.get("role") == "assistant")
-        cva = all_cva.lower()
-        
-        # Module-aware validation
-        module = (result.scenario.get("excel", {}) or {}).get("module", "").lower()
+    async def _validate(self, result: TestResult, conversation: List[Dict]):
+        return await self._validate_with_semantic_fallback(result, conversation)
 
-        # ---------------- Excel KB contradiction check ----------------
-        # If Excel expects a specific KB (Source KB is filled), CVA must NOT claim:
-        # "not sourced from KB" / "no documentation in my knowledge base", etc.
-        excel = (result.scenario.get("excel") or {})
-        expected_kb = (excel.get("source_kb") or "").strip()
+    async def _validate_with_semantic_fallback(self, result: TestResult, conversation: List[Dict]):
+        module = result.scenario.get("category", "")
+        validator = ValidatorFactory.get_validator(module)
 
-        if expected_kb:
-            bad_phrases = [
-                "not sourced from your organization's knowledge base",
-                "not sourced from your organization's knowledge base",
-                "not sourced from your organisations knowledge base",
-                "not sourced from your organisation's knowledge base",
-                "i don't have any specific troubleshooting",
-                "i don't have specific troubleshooting",
-                "i don't have any specific documentation",
-                "i don't have specific documentation",
-                "not available in my knowledge base",
-                "no documentation",
-                "do not have access to documentation",
-                "i do not have access to documentation",
-            ]
+        validation = validator.validate(result, conversation)
 
-            hit = next((p for p in bad_phrases if p in cva), None)
-            if hit:
-                key = "does_not_contradict_kb_availability"
-                if key not in result.validations_failed:
-                    result.validations_failed.append(key)
-                msg = f"CVA contradiction: Excel expects KB '{expected_kb}', but CVA said: '{hit}'."
-                if msg not in result.bugs_found:
-                    result.bugs_found.append(msg)
-        # --------------------------------------------------------------
+        # Remove duplicates
+        result.validations_passed.clear()
+        result.validations_failed.clear()
 
-        # Helper functions for validation
-        def assistant_has_troubleshooting(m: Dict) -> bool:
-            t = (m.get("content") or "").lower()
-            return ("step" in t) or ("citation" in t) or ("troubleshoot" in t)
+        if validation["passed"]:
+            result.validations_passed.append("module_validation_passed")
+            result.notes = "Validation passed"
+        else:
+            for f in validation["failures"]:
+                if f not in result.validations_failed:
+                    result.validations_failed.append(f)
+                    result.bugs_found.append(f)
 
-        def any_kb_link(links: List[str]) -> bool:
-            return any("knowledgebasestaging.blob.core.windows.net" in (u or "").lower() for u in (links or []))
+            result.notes = "Validation failed"
 
-        # Aggregate links seen in assistant messages
-        all_links: List[str] = []
-        for m in conversation:
-            if m.get("role") == "assistant":
-                for u in (m.get("links") or []):
-                    if u and u not in all_links:
-                        all_links.append(u)
+        # If modular validator failed AND expected_response exists,
+        # run semantic judge as secondary confirmation
+        if not validation["passed"]:
+            expected = (result.scenario.get("excel", {}) or {}).get("expected_response", "")
+            if expected and self.ai_brain.is_available():
 
-        # Excel-only contradiction check (no need to add a validation key in loader)
-        excel = (result.scenario.get("excel") or {})
-        expected_kb = (excel.get("source_kb") or "").strip()
-
-        if expected_kb:
-            bad_phrases = [
-                "not sourced from your organization's knowledge base",
-                "not sourced from your organization's knowledge base",
-                "i don't have any specific troubleshooting",
-                "i don't have specific troubleshooting",
-                "i don't have any specific documentation",
-                "i don't have specific documentation",
-                "not available in my knowledge base",
-                "no documentation",
-                "do not have access to documentation",
-            ]
-            if any(p in cva for p in bad_phrases):
-                # mark as failure + explain clearly
-                result.validations_failed.append("does_not_contradict_kb_availability")
-                result.bugs_found.append(
-                    f"CVA contradiction: Excel expects KB '{expected_kb}', but CVA claimed answer is not from KB / no KB documentation."
+                judge = await self.ai_brain.judge_expected(
+                    user_query=result.scenario.get("excel", {}).get("user_query", ""),
+                    cva_response=result.actual_first_reply,
+                    expected=expected,
+                    action=result.scenario.get("excel", {}).get("action", "")
                 )
 
-        for v in validations:
-            passed = False
+                if judge.get("matches"):
+                    result.status = "passed"
+                    result.notes = "Passed via semantic validation"
+                    return
 
-            if v == "provides_troubleshooting_steps":
-                passed = any(w in cva for w in ["step", "try", "check", "restart", "1.", "troubleshoot"])
-            elif v == "includes_citations":
-                passed = contains_citation(all_cva)
-            elif v == "includes_kb_hyperlink":
-                # mandatory: any troubleshooting reply should include KB hyperlink
-                ok_all = True
-                for m in conversation:
-                    if m.get("role") == "assistant" and assistant_has_troubleshooting(m):
-                        if not any_kb_link(m.get("links") or []):
-                            ok_all = False
-                            break
-                passed = ok_all
-            elif v == "asks_follow_up_questions":
-                passed = "?" in all_cva
-            elif v == "creates_incident":
-                passed = contains_ticket_confirmation(all_cva)
-            elif v == "returns_inc_number":
-                passed = bool(extract_ticket_number(all_cva))
-            elif v == "shows_ticket_details":
-                passed = any(w in cva for w in ["ticket details", "incident number", "status:"])
-            elif v == "shows_catalog_item":
-                # now card text should be captured (Complete this request etc.)
-                passed = contains_service_catalog(all_cva) or ("complete this request" in cva)
-            elif v == "detects_service_request":
-                passed = any(w in cva for w in ["service", "catalog", "ritm", "complete this request"])
-            elif v in ("shows_ticket_list", "includes_inc_numbers"):
-                passed = contains_ticket_list(all_cva)
-            elif v == "initiates_handoff":
-                # soft pass for now: either real handoff OR clear unavailability message
-                passed = ("live handover" in cva) or ("no servicenow agents are available" in cva) or ("try reaching out again" in cva)
-            elif v == "has_tool_action":
-                # New advanced validation first
-                advanced = self._intent_validation(result, all_cva, all_links)
-
-                if advanced is not None:
-                    passed = advanced
-                else:
-                    # fallback to old behavior
-                    txt = all_cva.lower()
-                    has_ticket = bool(extract_ticket_number(all_cva))
-                    has_servicenow_link = any("servicenow" in (u or "").lower() for u in all_links)
-                    passed = has_ticket or has_servicenow_link
-            elif v == "matches_expected_semantic":
-                if "catalog" in module:
-                    expected = (result.scenario.get("excel", {}) or {}).get("expected_response", "").lower()
-                    passed = all(item.strip().lower() in all_cva.lower() for item in expected.split("\n") if item.strip())
-                elif "ticket" in module:
-                    expected_action = (result.scenario.get("excel", {}) or {}).get("action", "").lower()
-                    
-                    if "create" in expected_action:
-                        passed = "incident number" in all_cva.lower()
-                    elif "update" in expected_action:
-                        passed = "updated" in all_cva.lower()
-                    elif "close" in expected_action:
-                        passed = "closed" in all_cva.lower()
-                    else:
-                        passed = (v in result.validations_passed) and (v not in result.validations_failed)
-                else:
-                    passed = (v in result.validations_passed) and (v not in result.validations_failed)
-            elif v == "includes_specific_kb":
-                expected_kb = (result.scenario.get("excel", {}) or {}).get("source_kb", "")
-                
-                # Network & Connectivity (VPN) special handling
-                if "network" in module:
-                    kb_links = result.kb_links_found or []
-                    passed = any("vpn" in link.lower() for link in kb_links)
-                else:
-                    expected_kb_norm = re.sub(r"[\s_]+", "", (expected_kb or "").lower()).strip()
-
-                    # Gather found KB-ish links for reporting
-                    found_kb_links = [u for u in all_links if ("blob.core.windows.net" in (u or "").lower()) or (".pdf" in (u or "").lower()) or (".docx" in (u or "").lower())]
-                    found_preview = ", ".join(found_kb_links[:3])
-
-                    passed = any(
-                        expected_kb_norm and expected_kb_norm in re.sub(r"[\s_]+", "", (u or "").lower())
-                        for u in all_links
-                    )
-            elif v in ("detects_language", "responds_in_same_language"):
-                passed = detect_response_language(all_cva) != "English"
-            elif v in ("handles_gracefully", "no_error_crash"):
-                passed = not contains_error_indicators(all_cva) and len(all_cva) > 10
-            else:
-                # Unknown validation key should FAIL so we notice missing implementation
-                passed = False
-                result.bugs_found.append(f"Unknown validation key (not implemented): {v}")
-
-            if passed:
-                result.validations_passed.append(v)
-            else:
-                if v not in result.validations_failed:
-                    result.validations_failed.append(v)
-
-                # Human-readable reasons for Excel-driven validations
-                if v == "has_tool_action":
-                    result.bugs_found.append(
-                        "Action failed (ToolCalling=Y): No INC/RITM and no ServiceNow/catalog link/text detected (e.g., 'View in ServiceNow', 'Complete this request')."
-                    )
-                elif v == "includes_kb_hyperlink":
-                    result.bugs_found.append(
-                        "KB hyperlink missing: Troubleshooting response should include a KB hyperlink, but no KB URL was captured from Teams."
-                    )
-                elif v == "includes_specific_kb":
-                    expected_kb = (result.scenario.get("excel", {}) or {}).get("source_kb", "")
-                    found_kb_links = [u for u in all_links if ("blob.core.windows.net" in (u or "").lower()) or (".pdf" in (u or "").lower()) or (".docx" in (u or "").lower())]
-                    found_preview = ", ".join(found_kb_links[:3])
-                    result.bugs_found.append(
-                        f"KB mismatch: Expected '{expected_kb}'. Found links: {found_preview or 'NO KB LINKS CAPTURED'}"
-                    )
-                elif v == "matches_expected_semantic":
-                    reason = ""
-                    if isinstance(getattr(result, "expected_judge", None), dict):
-                        reason = result.expected_judge.get("reason", "")
-                    sim = getattr(result, "expected_similarity", None)
-                    result.bugs_found.append(
-                        f"Expected response mismatch: similarity={sim} judge_reason={reason}"
-                    )
-                else:
-                    result.bugs_found.append(f"Failed validation: {v}")
+        return self._fin(result)
 
     async def stop_tests(self):
         self.should_stop = True

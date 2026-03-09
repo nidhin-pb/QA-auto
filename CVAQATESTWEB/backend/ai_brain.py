@@ -48,6 +48,15 @@ def _sounds_like_bot(text: str) -> bool:
 
 class AIBrain:
     def __init__(self):
+        # Primary API: OpenAI FuturePath ML
+        self.openai_futurepath_key = getattr(app_config.ai, "openai_api_key_futurepath_ml", "")
+        
+        # Secondary API: Azure OpenAI
+        self.azure_openai_key = getattr(app_config.ai, "azure_openai_api_key", "")
+        self.azure_openai_endpoint = getattr(app_config.ai, "azure_openai_endpoint", "")
+        self.azure_openai_api_version = getattr(app_config.ai, "azure_openai_api_version", "2024-12-01-preview")
+        
+        # Fallback APIs: Bytez
         self.bytez_keys = [
             getattr(app_config.ai, "bytez_api_key", ""),
             getattr(app_config.ai, "bytez_api_key_2", ""),
@@ -78,36 +87,133 @@ class AIBrain:
             return
         self._api_tested = True
 
-        if not self.bytez_keys:
+        # Test Primary: OpenAI FuturePath ML (Updated Working Key)
+        if self.openai_futurepath_key:
+            await ws_manager.send_log("info", "Testing OpenAI FuturePath ML...")
+            try:
+                import openai
+                client = openai.OpenAI(api_key=self.openai_futurepath_key)
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": "Reply with exactly: WORKING"}],
+                    max_tokens=10
+                )
+                if response.choices[0].message.content.strip().upper() == "WORKING":
+                    self._working_model = "openai_futurepath"
+                    self.ai_available = True
+                    await ws_manager.send_log("success", "✅ OpenAI FuturePath ML is working")
+                    return
+            except Exception as e:
+                await ws_manager.send_log("warning", f"❌ OpenAI FuturePath ML failed: {e}")
+
+        # Test Secondary: Azure OpenAI
+        if self.azure_openai_key and self.azure_openai_endpoint:
+            await ws_manager.send_log("info", "Testing Azure OpenAI...")
+            try:
+                import openai
+                client = openai.AzureOpenAI(
+                    api_key=self.azure_openai_key,
+                    azure_endpoint=self.azure_openai_endpoint,
+                    api_version=self.azure_openai_api_version
+                )
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": "Reply with exactly: WORKING"}],
+                    max_tokens=10
+                )
+                if response.choices[0].message.content.strip().upper() == "WORKING":
+                    self._working_model = "azure_openai"
+                    self.ai_available = True
+                    await ws_manager.send_log("success", "✅ Azure OpenAI is working")
+                    return
+            except Exception as e:
+                await ws_manager.send_log("warning", f"❌ Azure OpenAI failed: {e}")
+
+        # Test Fallback: Bytez
+        if self.bytez_keys:
+            await ws_manager.send_log("info", f"Bytez keys configured: {len(self.bytez_keys)}")
+
+            for model_name in self.models_to_try:
+                await ws_manager.send_log("info", f"Testing {model_name}...")
+
+                probe = await self._call_bytez_single_model(
+                    model_name=model_name,
+                    prompt="Reply with exactly: WORKING",
+                    system="Reply with exactly one word: WORKING"
+                )
+
+                if probe and probe.strip().upper() == "WORKING":
+                    self._working_model = model_name
+                    self.ai_available = True
+                    await ws_manager.send_log("success", f"✅ Bytez {model_name} is working")
+                    return
+
+                await ws_manager.send_log("warning", f"{model_name} probe not valid (got: {(probe or '')[:60]})")
+
+        # All APIs failed
+        if not self._working_model:
             self._ai_disabled = True
             self.ai_available = False
             self._working_model = None
-            await ws_manager.send_log("warning", "⚠️ No BYTEZ_API_KEY configured. Using templates only.")
-            return
+            await ws_manager.send_log("error", "❌ All AI APIs failed. Using templates only.")
 
-        await ws_manager.send_log("info", f"Bytez keys configured: {len(self.bytez_keys)}")
-
-        for model_name in self.models_to_try:
-            await ws_manager.send_log("info", f"Testing {model_name}...")
-
-            probe = await self._call_bytez_single_model(
-                model_name=model_name,
-                prompt="Reply with exactly: WORKING",
-                system="Reply with exactly one word: WORKING"
+    async def _call_openai_futurepath(self, prompt: str, system: str = None) -> str:
+        """Call OpenAI FuturePath ML API"""
+        if not self.openai_futurepath_key:
+            return ""
+        
+        try:
+            import openai
+            client = openai.OpenAI(api_key=self.openai_futurepath_key)
+            
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=messages,
+                max_tokens=1000,
+                temperature=0.7
             )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            await ws_manager.send_log("warning", f"OpenAI FuturePath error: {e}")
+            return ""
 
-            if probe and probe.strip().upper() == "WORKING":
-                self._working_model = model_name
-                self.ai_available = True
-                await ws_manager.send_log("info", f"✅ Selected model: {model_name}")
-                return
-
-            await ws_manager.send_log("warning", f"{model_name} probe not valid (got: {(probe or '')[:60]})")
-
-        self._working_model = None
-        self._ai_disabled = True
-        self.ai_available = False
-        await ws_manager.send_log("warning", "⚠️ No AI model available (credits/network). Using templates only.")
+    async def _call_azure_openai(self, prompt: str, system: str = None) -> str:
+        """Call Azure OpenAI API"""
+        if not self.azure_openai_key or not self.azure_openai_endpoint:
+            return ""
+        
+        try:
+            import openai
+            client = openai.AzureOpenAI(
+                api_key=self.azure_openai_key,
+                azure_endpoint=self.azure_openai_endpoint,
+                api_version=self.azure_openai_api_version
+            )
+            
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=messages,
+                max_tokens=1000,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            await ws_manager.send_log("warning", f"Azure OpenAI error: {e}")
+            return ""
 
     async def _call_bytez_single_model(self, model_name: str, prompt: str, system: str = None) -> str:
         if self._ai_disabled:
@@ -191,6 +297,25 @@ class AIBrain:
         if self._ai_disabled:
             return ""
 
+        # Try Primary: OpenAI FuturePath ML
+        if self._working_model == "openai_futurepath":
+            result = await self._call_openai_futurepath(prompt, system)
+            if result:
+                return result
+
+        # Try Secondary: Azure OpenAI
+        if self._working_model == "azure_openai":
+            result = await self._call_azure_openai(prompt, system)
+            if result:
+                return result
+
+        # Try Fallback: Bytez
+        if self._working_model in self.models_to_try:
+            result = await self._call_bytez_single_model(self._working_model, prompt, system)
+            if result:
+                return result
+
+        # Try Fallback: Any available Bytez model
         candidates = []
         if prefer_model:
             candidates.append(prefer_model)
@@ -198,11 +323,11 @@ class AIBrain:
             if m not in candidates:
                 candidates.append(m)
 
-        for m in candidates:
-            txt = await self._call_bytez_single_model(m, prompt, system=system)
-            if txt:
-                self._working_model = m
-                return txt
+        for model_name in candidates:
+            result = await self._call_bytez_single_model(model_name, prompt, system)
+            if result:
+                return result
+
         return ""
 
     def _clean_response(self, text: str) -> str:

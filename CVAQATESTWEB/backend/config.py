@@ -19,6 +19,14 @@ class AIConfig(BaseModel):
     deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+    # OpenAI FuturePath ML (primary)
+    openai_api_key_futurepath_ml: str = os.getenv("OPENAI_API_KEY_FUTUREPATH_ML", "")
+    
+    # Azure OpenAI (secondary)
+    azure_openai_api_key: str = os.getenv("AZURE_OPENAI_API_KEY", "")
+    azure_openai_endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    azure_openai_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+
     # Bytez SDK key (ENV overrides file default)
     bytez_api_key: str = os.getenv("BYTEZ_API_KEY", "2c38c79903e0f2190ab2c6bdcb4b4474")
     bytez_api_key_2: str = os.getenv("BYTEZ_API_KEY_2", "")

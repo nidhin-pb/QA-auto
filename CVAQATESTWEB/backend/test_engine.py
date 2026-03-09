@@ -300,15 +300,15 @@ class TestEngine:
                     "links": links,
                 })
 
+                # Capture first and last actual replies for reporting and validation
+                if not result.actual_first_reply:
+                    result.actual_first_reply = cva_response
+                result.actual_last_reply = cva_response
+
                 # Excel single-turn tests: stop after first CVA response
                 if result.scenario.get("stop_after_first_response") and turn >= 1:
                     await ws_manager.send_log("info", "Stopping after first response (single-turn Excel test).")
                     break
-
-                # Capture first and last actual replies for reporting
-                if not result.actual_first_reply:
-                    result.actual_first_reply = cva_response
-                result.actual_last_reply = cva_response
 
                 ticket = extract_ticket_number(cva_response)
                 if ticket and ticket not in self.discovered_tickets:
@@ -444,7 +444,7 @@ class TestEngine:
                     result.conversation_log.append({"role": "user", "content": follow_up, "timestamp": timestamp_readable()})
 
             await self._check_expected_response(result, conversation)
-            self._validate(result, conversation)
+            await self._validate(result, conversation)
 
             if result.status == "stopped":
                 pass

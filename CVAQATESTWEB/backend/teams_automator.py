@@ -514,31 +514,30 @@ class TeamsAutomator:
             inp = await self._find_input()
             if inp:
                 await inp.click()
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.5)
         except Exception:
             pass
 
-        async def verify_file_visible(timeout_s: int = 12) -> bool:
+        async def verify_file_visible(timeout_s: int = 15) -> bool:
             for _ in range(timeout_s):
                 try:
                     body = await self.page.inner_text("body")
                     low = (body or "").lower()
-                    if all(fn.lower() in low for fn in filenames):
+                    if any(fn.lower() in low for fn in filenames):
                         return True
                 except Exception:
                     pass
                 await asyncio.sleep(1)
             return False
 
-        async def try_file_inputs() -> bool:
+        async def set_files_via_input() -> bool:
             try:
                 inputs = self.page.locator('input[type="file"]')
                 c = await inputs.count()
                 await ws_manager.send_log("info", f"Debug: input[type=file] count={c}")
-                if c <= 0:
-                    return False
-                for idx in [c - 1, 0]:
+                for idx in range(c):
                     try:
+                        await ws_manager.send_log("info", f"Trying input[type=file] index={idx}")
                         await inputs.nth(idx).set_input_files(paths)
                         await asyncio.sleep(2)
                         if await verify_file_visible(8):
@@ -549,87 +548,133 @@ class TeamsAutomator:
                 pass
             return False
 
-        async def try_attach_button_and_chooser() -> bool:
-            for sel in ['button[aria-label*="Attach"]', 'button[title*="Attach"]', 'button:has-text("Attach")', 'button:has-text("Attach file")']:
+        async def click_and_choose(locator) -> bool:
+            try:
+                async with self.page.expect_file_chooser(timeout=4000) as fc_info:
+                    await locator.click()
+                fc = await fc_info.value
+                await fc.set_files(paths)
+                await asyncio.sleep(2)
+                if await verify_file_visible(10):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        async def click_plus_icon() -> bool:
+            selectors = [
+                'button[aria-label*="Actions and apps"]',
+                'button[title*="Actions and apps"]',
+                'button[aria-label*="More options"]',
+                'button[title*="More options"]',
+                'button[aria-label*="Apps"]',
+                'button[title*="Apps"]',
+                'button:has-text("+")',
+                '[data-tid*="compose"] button:has-text("+")',
+            ]
+            for sel in selectors:
                 try:
-                    btn = self.page.locator(sel).first
-                    if await btn.is_visible(timeout=1200):
-                        try:
-                            async with self.page.expect_file_chooser(timeout=3000) as fc_info:
-                                await btn.click()
-                            fc = await fc_info.value
-                            await fc.set_files(paths)
-                            await asyncio.sleep(2)
-                            if await verify_file_visible(10):
-                                return True
-                        except Exception:
-                            await btn.click()
-                            await asyncio.sleep(1)
-                            if await try_file_inputs():
-                                return True
+                    el = self.page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await ws_manager.send_log("info", f"Clicked plus/actions selector: {sel}")
+                        await el.click()
+                        await asyncio.sleep(1)
+                        return True
                 except Exception:
                     continue
             return False
 
-        async def try_plus_menu_upload() -> bool:
-            for sel in ['button[aria-label*="Actions and apps"]', 'button[title*="Actions and apps"]', 'button[aria-label*="More actions"]', 'button[title*="More actions"]', 'button[aria-label*="Apps"]', 'button[title*="Apps"]']:
+        async def click_attach_file_entry() -> bool:
+            selectors = [
+                'div[role="menuitem"]:has-text("Attach file")',
+                'button:has-text("Attach file")',
+                'div[role="menuitem"]:has-text("Attach")',
+                'button:has-text("Attach")',
+                'div[role="menuitem"]:has-text("File")',
+                'button:has-text("File")',
+                '[role="menuitem"]:has-text("Upload from this device")',
+            ]
+            for sel in selectors:
                 try:
-                    b = self.page.locator(sel).first
-                    if await b.is_visible(timeout=1200):
-                        await b.click()
+                    el = self.page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await ws_manager.send_log("info", f"Clicked attach/file menu selector: {sel}")
+                        if await click_and_choose(el):
+                            return True
+                        await el.click()
                         await asyncio.sleep(1)
-                        break
+                        return True
                 except Exception:
                     continue
-            else:
-                return False
+            return False
 
-            for sel in ['div[role="menuitem"]:has-text("Upload from this device")', 'div[role="menuitem"]:has-text("Upload")', 'div[role="menuitem"]:has-text("Attach file")', 'div[role="menuitem"]:has-text("Attach")', 'button:has-text("Upload from this device")', 'button:has-text("Upload")', 'button:has-text("Attach file")', 'button:has-text("Attach")']:
+        async def click_paperclip_icon() -> bool:
+            selectors = [
+                'button[aria-label*="Attach"]',
+                'button[title*="Attach"]',
+                'button[aria-label*="File"]',
+                'button[title*="File"]',
+                '[data-tid*="attach"]',
+            ]
+            for sel in selectors:
                 try:
-                    item = self.page.locator(sel).first
-                    if not await item.is_visible(timeout=1200):
-                        continue
-                    try:
-                        async with self.page.expect_file_chooser(timeout=3000) as fc_info:
-                            await item.click()
-                        fc = await fc_info.value
-                        await fc.set_files(paths)
-                        await asyncio.sleep(2)
-                        if await verify_file_visible(10):
+                    el = self.page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await ws_manager.send_log("info", f"Clicked paperclip selector: {sel}")
+                        if await click_and_choose(el):
                             return True
-                    except Exception:
-                        await item.click()
+                        await el.click()
                         await asyncio.sleep(1)
-                        try:
-                            sub = self.page.locator('div[role="menuitem"]:has-text("Upload from this device"), button:has-text("Upload from this device")').first
-                            if await sub.is_visible(timeout=1500):
-                                try:
-                                    async with self.page.expect_file_chooser(timeout=3000) as fc_info2:
-                                        await sub.click()
-                                    fc2 = await fc_info2.value
-                                    await fc2.set_files(paths)
-                                    await asyncio.sleep(2)
-                                    if await verify_file_visible(10):
-                                        return True
-                                except Exception:
-                                    await sub.click()
-                                    await asyncio.sleep(1)
-                        except Exception:
-                            pass
-                        if await try_file_inputs():
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        async def click_upload_from_device() -> bool:
+            selectors = [
+                'div[role="menuitem"]:has-text("Upload from this device")',
+                'button:has-text("Upload from this device")',
+                'div[role="menuitem"]:has-text("Upload")',
+                'button:has-text("Upload")',
+            ]
+            for sel in selectors:
+                try:
+                    el = self.page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await ws_manager.send_log("info", f"Clicked upload-from-device selector: {sel}")
+                        if await click_and_choose(el):
+                            return True
+                        await el.click()
+                        await asyncio.sleep(1)
+                        if await set_files_via_input():
                             return True
                 except Exception:
                     continue
             return False
 
-        if await try_file_inputs():
-            await ws_manager.send_log("info", "✅ Attachment uploaded via input[type=file]")
-            return True
-        if await try_attach_button_and_chooser():
-            await ws_manager.send_log("info", "✅ Attachment uploaded via Attach button / chooser")
-            return True
-        if await try_plus_menu_upload():
-            await ws_manager.send_log("info", "✅ Attachment uploaded via '+' menu")
+        # Strategy 1: Plus -> Attach file -> Upload from this device
+        plus_clicked = await click_plus_icon()
+        if plus_clicked:
+            attach_clicked = await click_attach_file_entry()
+            if await click_upload_from_device():
+                await ws_manager.send_log("info", "✅ Attachment uploaded via + -> attach -> upload from this device")
+                return True
+            if await set_files_via_input():
+                await ws_manager.send_log("info", "✅ Attachment uploaded via menu input[type=file]")
+                return True
+
+        # Strategy 2: Paperclip directly
+        if await click_paperclip_icon():
+            if await click_upload_from_device():
+                await ws_manager.send_log("info", "✅ Attachment uploaded via paperclip -> upload from this device")
+                return True
+            if await set_files_via_input():
+                await ws_manager.send_log("info", "✅ Attachment uploaded via paperclip/input[type=file]")
+                return True
+
+        # Strategy 3: direct hidden input
+        if await set_files_via_input():
+            await ws_manager.send_log("info", "✅ Attachment uploaded via direct input[type=file]")
             return True
 
         await ws_manager.send_log("warning", "❌ Attachment upload failed in Teams UI")

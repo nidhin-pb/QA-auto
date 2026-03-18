@@ -16,7 +16,7 @@ function LiveView({ messages, chatEndRef }) {
       {messages.map((msg, i) => (
         <div key={i} className={`chat-message ${msg.sender}`}>
           <div className="chat-sender">
-            {msg.sender === 'user' ? 'Tester (AI)' : msg.sender === 'cva' ? 'CVA' : 'System'}
+            {msg.sender === 'user' ? 'Tester / Simulated User' : msg.sender === 'cva' ? 'CVA' : 'System'}
             <span style={{marginLeft:'8px', fontSize:'9px', opacity:0.6}}>{msg.time}</span>
           </div>
           <div>{msg.message}</div>

@@ -18,6 +18,10 @@ from test_scenarios import get_all_scenarios, get_categories
 from websocket_manager import ws_manager
 from utils import ensure_dir, sanitize_filename
 from excel_suite_loader import load_suite_from_bytes
+from structured_family_filtering import StructuredFamilyFiltering
+from structured_suite_loader import load_and_plan_structured_suite
+from safe_structured_filters import get_safe_structured_subset, get_recommended_first_run_subset
+from history import record_run
 
 ensure_dir(app_config.screenshot_dir)
 ensure_dir(app_config.report_dir)
@@ -35,6 +39,14 @@ app.add_middleware(
 
 test_engine: Optional[TestEngine] = None
 excel_suite = {"suite_name": "", "cases": [], "errors": []}
+structured_suite = {
+    "suite_name": "",
+    "cases": [],
+    "errors": [],
+    "preview": [],
+    "plan_summary": {},
+    "sheet_summaries": [],
+}
 
 
 class LoginRequest(BaseModel):
@@ -46,6 +58,16 @@ class LoginRequest(BaseModel):
 
 class RunTestsRequest(BaseModel):
     scenario_ids: Optional[List[str]] = None
+
+
+class RunStructuredSuiteRequest(BaseModel):
+    scenario_ids: Optional[List[str]] = None
+    modules: Optional[List[str]] = None
+    families: Optional[List[str]] = None
+    automation_levels: Optional[List[str]] = None
+    execution_modes: Optional[List[str]] = None
+    priorities: Optional[List[str]] = None
+    limit: Optional[int] = None
 
 
 @app.get("/api/health")
@@ -222,6 +244,177 @@ async def upload_attachments(files: List[UploadFile] = File(...)):
         "status": "ok",
         "count": len(saved_paths),
         "files": [{"name": os.path.basename(p), "path": p} for p in saved_paths],
+    }
+
+
+@app.get("/api/structured-suite")
+async def get_structured_suite():
+    return {
+        "suite_name": structured_suite.get("suite_name", ""),
+        "count": len(structured_suite.get("cases", [])),
+        "errors": structured_suite.get("errors", []),
+        "plan_summary": structured_suite.get("plan_summary", {}),
+        "sheet_summaries": structured_suite.get("sheet_summaries", []),
+        "preview": structured_suite.get("preview", [])[:100],
+    }
+
+
+@app.post("/api/structured-suite/upload")
+async def upload_structured_suite(file: UploadFile = File(...)):
+    raw = await file.read()
+    parsed = load_and_plan_structured_suite(file.filename or "structured_suite.xlsx", raw)
+
+    structured_suite["suite_name"] = parsed["suite_name"]
+    structured_suite["cases"] = parsed["legacy_cases"]   # current engine-compatible cases
+    structured_suite["errors"] = parsed["errors"]
+    structured_suite["preview"] = parsed["preview"]
+    structured_suite["plan_summary"] = parsed["plan_summary"]
+    structured_suite["sheet_summaries"] = parsed["sheet_summaries"]
+
+    await ws_manager.send_log(
+        "info",
+        f"Loaded Structured Suite: {structured_suite['suite_name']} cases={len(structured_suite['cases'])}"
+    )
+    if structured_suite["errors"]:
+        await ws_manager.send_log("warning", f"Structured Suite parse warnings: {structured_suite['errors']}")
+
+    return {
+        "status": "ok",
+        "suite_name": structured_suite["suite_name"],
+        "count": len(structured_suite["cases"]),
+        "errors": structured_suite["errors"],
+        "plan_summary": structured_suite["plan_summary"],
+        "sheet_summaries": structured_suite["sheet_summaries"],
+        "preview": structured_suite["preview"][:100],
+    }
+
+
+@app.get("/api/structured-suite/safe-subset")
+async def get_structured_suite_safe_subset():
+    cases = get_safe_structured_subset(structured_suite.get("cases", []))
+    return {
+        "suite_name": structured_suite.get("suite_name", ""),
+        "count": len(cases),
+        "preview": [
+            {
+                "id": c.get("id", ""),
+                "name": c.get("name", ""),
+                "priority": c.get("priority", ""),
+                "execution_mode": c.get("execution_mode", ""),
+                "automation_level": c.get("automation_level", ""),
+                "family": c.get("family", "") or ((c.get("excel", {}) or {}).get("family", "")),
+            }
+            for c in cases[:50]
+        ]
+    }
+
+
+@app.get("/api/structured-suite/recommended-first-run")
+async def get_structured_suite_recommended_first_run():
+    cases = get_recommended_first_run_subset(structured_suite.get("cases", []))
+    return {
+        "suite_name": structured_suite.get("suite_name", ""),
+        "count": len(cases),
+        "preview": [
+            {
+                "id": c.get("id", ""),
+                "name": c.get("name", ""),
+                "priority": c.get("priority", ""),
+                "execution_mode": c.get("execution_mode", ""),
+                "automation_level": c.get("automation_level", ""),
+                "family": c.get("family", "") or ((c.get("excel", {}) or {}).get("family", "")),
+            }
+            for c in cases[:20]
+        ]
+    }
+
+
+@app.post("/api/run-structured-suite")
+async def run_structured_suite(request: RunStructuredSuiteRequest):
+    global test_engine
+    if not test_engine:
+        raise HTTPException(status_code=400, detail="Engine not initialized. Call /api/initialize first.")
+    if test_engine.is_running:
+        raise HTTPException(status_code=400, detail="Already running.")
+    if not structured_suite.get("cases"):
+        raise HTTPException(status_code=400, detail="No structured suite loaded. Upload first.")
+
+    cases = structured_suite["cases"][:]
+
+    cases = StructuredFamilyFiltering.apply(
+        cases,
+        modules=request.modules,
+        families=request.families,
+        execution_modes=request.execution_modes,
+        automation_levels=request.automation_levels,
+        priorities=request.priorities,
+    )
+
+    if request.scenario_ids:
+        wanted = set(request.scenario_ids)
+        cases = [c for c in cases if c.get("id") in wanted]
+
+    if request.limit and request.limit > 0:
+        cases = cases[: request.limit]
+
+    if not cases:
+        raise HTTPException(status_code=400, detail="No structured scenarios matched the selected filters.")
+
+    asyncio.create_task(
+        test_engine.run_custom_suite(
+            cases,
+            suite_name=structured_suite.get("suite_name", "Structured Suite")
+        )
+    )
+    return {
+        "status": "started",
+        "mode": "structured_suite",
+        "count": len(cases),
+        "filters": request.model_dump(),
+    }
+
+
+@app.get("/api/structured-suite/recommended-first-run-ids")
+async def get_structured_suite_recommended_first_run_ids():
+    cases = get_recommended_first_run_subset(structured_suite.get("cases", []))
+    return {
+        "suite_name": structured_suite.get("suite_name", ""),
+        "scenario_ids": [c.get("id", "") for c in cases[:10]],
+        "count": min(len(cases), 10),
+    }
+
+
+@app.get("/api/structured-suite/classification-summary")
+async def get_structured_suite_classification_summary():
+    cases = structured_suite.get("cases", []) or []
+
+    modules = {}
+    families = {}
+    execution_modes = {}
+    automation_levels = {}
+    priorities = {}
+
+    for c in cases:
+        module = c.get("category", "") or "Unknown"
+        family = c.get("family", "") or ((c.get("excel", {}) or {}).get("family", "")) or "generic"
+        mode = c.get("execution_mode", "") or "unknown"
+        level = c.get("automation_level", "") or "unknown"
+        priority = c.get("priority", "") or "unknown"
+
+        modules[module] = modules.get(module, 0) + 1
+        families[family] = families.get(family, 0) + 1
+        execution_modes[mode] = execution_modes.get(mode, 0) + 1
+        automation_levels[level] = automation_levels.get(level, 0) + 1
+        priorities[priority] = priorities.get(priority, 0) + 1
+
+    return {
+        "suite_name": structured_suite.get("suite_name", ""),
+        "total": len(cases),
+        "modules": modules,
+        "families": families,
+        "execution_modes": execution_modes,
+        "automation_levels": automation_levels,
+        "priorities": priorities,
     }
 
 

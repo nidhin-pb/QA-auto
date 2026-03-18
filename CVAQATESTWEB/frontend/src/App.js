@@ -3,6 +3,7 @@ import './App.css';
 import LoginConfig from './components/LoginConfig';
 import AttachmentConfig from './components/AttachmentConfig';
 import ExcelSuiteConfig from './components/ExcelSuiteConfig';
+import StructuredSuiteConfig from './components/StructuredSuiteConfig';
 import LiveView from './components/LiveView';
 import TestDashboard from './components/TestDashboard';
 import ReportView from './components/ReportView';
@@ -214,6 +215,26 @@ function App() {
     }
   };
 
+  const handleRunStructuredSuite = async (payload) => {
+    try {
+      setChatMessages([]);
+      setTestResults([]);
+      setLogs([]);
+
+      const res = await fetch(`${API_BASE}/api/run-structured-suite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {})
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to start structured suite');
+      setActiveTab('live');
+    } catch (err) {
+      setStatus({ status: 'error', message: err.message });
+    }
+  };
+
   const handleStopTests = async () => {
     try {
       await fetch(`${API_BASE}/api/stop-tests`, { method: 'POST' });
@@ -325,6 +346,12 @@ function App() {
       isRunning={isRunning}
       isInitialized={isInitialized}
       onRunSuite={handleRunExcelSuite}
+    />
+    <StructuredSuiteConfig
+      apiBase={API_BASE}
+      isRunning={isRunning}
+      isInitialized={isInitialized}
+      onRunStructuredSuite={handleRunStructuredSuite}
     />
   </div>
 )}

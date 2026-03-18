@@ -1,11 +1,11 @@
 """
-Compact Report Generator (2 sheets only)
+QA Report Generator (2 sheets)
 
-Sheet 1: QA Results (Compact)
-- One row per test case
-- Excel expectations + actual reply + links + judge results + bug explanation
+Sheet 1: QA Summary
+- Clean, tester-friendly presentation
+- Key results, tickets, and links
 
-Sheet 2: Failure Evidence
+Sheet 2: Failure Details  
 - Only failed/error tests
 - Conversation transcript + links for debugging
 
@@ -38,7 +38,9 @@ class ReportGenerator:
         wb = Workbook()
         wb.remove(wb.active)
 
+        self._create_qa_summary_sheet(wb, results)
         self._create_compact_results_sheet(wb, results)
+        self._create_test_cases_reference_sheet(wb, results)
         self._create_failure_evidence_sheet(wb, results)
 
         filename = f"CVA_QA_Report_{timestamp()}.xlsx"
@@ -123,16 +125,29 @@ class ReportGenerator:
 
         if not bits:
             bits.append("General response only")
+
+        family = ((getattr(r, "scenario", {}) or {}).get("excel", {}) or {}).get("family", "")
+        if family:
+            bits.append(f"Family: {family}")
+
         return " | ".join(bits)
 
     def _top_failure_reason(self, r: Any) -> str:
-        """
-        Produce one strong, readable reason.
-        Prefer explicit bug messages, else validations_failed, else error_message.
-        """
         bugs = getattr(r, "bugs_found", None) or []
         if bugs:
             return str(bugs[0])[:800]
+
+        notes = getattr(r, "notes", "") or ""
+        if notes.strip():
+            return notes[:800]
+
+        alt = getattr(r, "alternate_reason", "") or ""
+        if alt.strip():
+            return alt[:800]
+
+        goal = getattr(r, "goal_achieved_reason", "") or ""
+        if goal.strip():
+            return goal[:800]
 
         vfail = getattr(r, "validations_failed", None) or []
         if vfail:
@@ -146,34 +161,90 @@ class ReportGenerator:
 
     # ---------------- Sheet 1 ----------------
 
-    def _create_compact_results_sheet(self, wb: Workbook, results: List[Any]):
-        ws = wb.create_sheet("QA Results (Compact)", 0)
+    def _create_qa_summary_sheet(self, wb: Workbook, results: List[Any]):
+        ws = wb.create_sheet("QA Summary", 0)
 
         headers = [
             "Test ID",
-            "Status",
-            "Priority",
-            "Client",
+            "Scenario Title",
             "Module",
-            "User Query",
-            "Action",
-            "Tool Calling",
-            "Source KB",
-            "Expected Response",
+            "Family",
+            "Execution Mode",
+            "User Prompt",
+            "Actual Bot Response",
+            "QA Status",
+            "QA Score",
+            "QA Grade",
+            "Key Result / Reason",
+            "Ticket ID(s)",
+            "KB Link(s)",
+        ]
+
+        header_fill = PatternFill(start_color="2F855A", end_color="2F855A", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+
+        for row_idx, r in enumerate(results, start=2):
+            all_bot = self._get_all_bot_text(r)
+            first_bot = self._get_first_bot_reply(r)
+            excel = self._get_excel_meta(r)
+            tickets = extract_all_ticket_numbers(all_bot)
+            links = self._get_all_links(r)
+
+            family = getattr(r, "structured_family", "") or excel.get("family", "")
+            key_reason = self._top_failure_reason(r) or getattr(r, "goal_achieved_reason", "") or getattr(r, "notes", "")
+
+            ws.cell(row=row_idx, column=1, value=getattr(r, "test_id", ""))
+            ws.cell(row=row_idx, column=2, value=getattr(r, "test_name", ""))
+            ws.cell(row=row_idx, column=3, value=getattr(r, "category", ""))
+            ws.cell(row=row_idx, column=4, value=family)
+            ws.cell(row=row_idx, column=5, value=getattr(r, "execution_mode", ""))
+            ws.cell(row=row_idx, column=6, value=(excel.get("user_query") or "")[:1500])
+            ws.cell(row=row_idx, column=7, value=(first_bot or "")[:3000])
+            ws.cell(row=row_idx, column=8, value=getattr(r, "display_status", getattr(r, "final_status", getattr(r, "status", ""))))
+            ws.cell(row=row_idx, column=9, value=getattr(r, "qa_score", ""))
+            ws.cell(row=row_idx, column=10, value=getattr(r, "qa_grade", ""))
+            ws.cell(row=row_idx, column=11, value=(key_reason or "")[:1500])
+            ws.cell(row=row_idx, column=12, value=", ".join(tickets[:10]))
+            ws.cell(row=row_idx, column=13, value="\n".join(links[:10]))
+
+            for col_idx in range(1, len(headers) + 1):
+                ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+
+        widths = [12, 40, 24, 18, 18, 40, 50, 16, 10, 12, 45, 22, 40]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ---------------- Sheet 2 ----------------
+
+    def _create_compact_results_sheet(self, wb: Workbook, results: List[Any]):
+        ws = wb.create_sheet("QA Results (Compact)", 1)
+
+        headers = [
+            "Test ID",
+            "Scenario Title",
+            "Module",
+            "Family",
+            "Execution Mode",
+            "Priority",
+            "User Prompt",
             "First Bot Reply",
             "Action Detected",
-            "KB Links",
-            "Tickets",
-            "Similarity",
-            "Judge Matches",
-            "Judge Relevance",
-            "Judge Reason",
-            "AI Semantic Match",
-            "Semantic Confidence",
-            "AI Intent Match",
-            "Deterministic Validation Result",
-            "Lifecycle Status",
-            "Top Bug / Failure Reason",
+            "QA Status",
+            "QA Score",
+            "QA Grade",
+            "Ticket ID(s)",
+            "KB / Links",
+            "Goal Achieved",
+            "Key Reason / Notes",
+            "Alternate Outcome",
+            "Conversation Turns",
+            "Duration (s)",
         ]
 
         header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
@@ -190,74 +261,146 @@ class ReportGenerator:
             first_bot = self._get_first_bot_reply(r)
             all_bot = self._get_all_bot_text(r)
             links = self._get_all_links(r)
-            kb_links = self._kb_links_only(links)
             tickets = extract_all_ticket_numbers(all_bot)
+            conv_log = getattr(r, "conversation_log", []) or []
+            num_turns = len([m for m in conv_log if (m.get("role") or "").lower() in ("assistant", "cva")])
 
-            judge = getattr(r, "expected_judge", None) or {}
-            sim = getattr(r, "expected_similarity", "")
+            family = getattr(r, "structured_family", "") or excel.get("family", "")
+            key_reason = self._top_failure_reason(r) or getattr(r, "goal_achieved_reason", "") or getattr(r, "notes", "")
 
             ws.cell(row=row_idx, column=1, value=getattr(r, "test_id", ""))
-            ws.cell(row=row_idx, column=2, value=getattr(r, "status", ""))
-            ws.cell(row=row_idx, column=3, value=getattr(r, "priority", ""))
-
-            ws.cell(row=row_idx, column=4, value=excel.get("client", ""))
-            ws.cell(row=row_idx, column=5, value=excel.get("module", ""))
-
-            ws.cell(row=row_idx, column=6, value=(excel.get("user_query") or getattr(r, "test_name", "") or "")[:3000])
-            ws.cell(row=row_idx, column=7, value=(excel.get("action") or "")[:1200])
-            ws.cell(row=row_idx, column=8, value="Y" if excel.get("tool_calling_queries") else "N")
-            ws.cell(row=row_idx, column=9, value=(excel.get("source_kb") or "")[:800])
-            ws.cell(row=row_idx, column=10, value=(excel.get("expected_response") or "")[:5000])
-
-            ws.cell(row=row_idx, column=11, value=(first_bot or "")[:5000])
-            ws.cell(row=row_idx, column=12, value=self._action_detected_summary(r))
-            ws.cell(row=row_idx, column=13, value="\n".join(kb_links)[:8000])
-            ws.cell(row=row_idx, column=14, value=", ".join(tickets[:10]))
-
-            ws.cell(row=row_idx, column=15, value=sim)
-            ws.cell(row=row_idx, column=16, value=str(judge.get("matches", "")))
-            ws.cell(row=row_idx, column=17, value=judge.get("relevance", ""))
-            ws.cell(row=row_idx, column=18, value=(judge.get("reason", "") or "")[:1200])
-
-            # New semantic confidence and AI intent match columns
-            semantic_score = ""
-            semantic_match = ""
-            if getattr(r, "excel_expected_response", None):
-                judge = getattr(r, "expected_judge", None) or {}
-                semantic_score = judge.get("relevance", "")
-                semantic_match = judge.get("matches", "")
-
-            ws.cell(row=row_idx, column=19, value=semantic_match)  # AI Semantic Match
-            ws.cell(row=row_idx, column=20, value=semantic_score)  # Semantic Confidence
-            ws.cell(row=row_idx, column=21, value=semantic_score)  # AI Intent Match
-            ws.cell(row=row_idx, column=22, value=getattr(r, "status", ""))  # Deterministic Validation Result
-            
-            # Lifecycle status
-            state = getattr(r, "state", {})
-            lifecycle_status = []
-            if state.get("ticket_created"):
-                lifecycle_status.append("Created")
-            if state.get("ticket_updated"):
-                lifecycle_status.append("Updated")
-            if state.get("ticket_resolved"):
-                lifecycle_status.append("Resolved")
-            if state.get("ticket_closed"):
-                lifecycle_status.append("Closed")
-            
-            ws.cell(row=row_idx, column=23, value=", ".join(lifecycle_status) if lifecycle_status else "N/A")  # Lifecycle Status
-            ws.cell(row=row_idx, column=24, value=self._top_failure_reason(r))  # Top Bug / Failure Reason
+            ws.cell(row=row_idx, column=2, value=getattr(r, "test_name", ""))
+            ws.cell(row=row_idx, column=3, value=getattr(r, "category", ""))
+            ws.cell(row=row_idx, column=4, value=family)
+            ws.cell(row=row_idx, column=5, value=getattr(r, "execution_mode", ""))
+            ws.cell(row=row_idx, column=6, value=getattr(r, "priority", ""))
+            ws.cell(row=row_idx, column=7, value=(excel.get("user_query") or "")[:1500])
+            ws.cell(row=row_idx, column=8, value=(first_bot or "")[:3000])
+            ws.cell(row=row_idx, column=9, value=self._action_detected_summary(r))
+            ws.cell(row=row_idx, column=10, value=getattr(r, "display_status", getattr(r, "final_status", getattr(r, "status", ""))))
+            ws.cell(row=row_idx, column=11, value=getattr(r, "qa_score", ""))
+            ws.cell(row=row_idx, column=12, value=getattr(r, "qa_grade", ""))
+            ws.cell(row=row_idx, column=13, value=", ".join(tickets[:10]))
+            ws.cell(row=row_idx, column=14, value="\n".join(links[:5]))
+            ws.cell(row=row_idx, column=15, value=getattr(r, "goal_achieved_reason", "") or "")
+            ws.cell(row=row_idx, column=16, value=(key_reason or "")[:1500])
+            ws.cell(row=row_idx, column=17, value="Yes" if getattr(r, "alternate_outcome", False) else "No")
+            ws.cell(row=row_idx, column=18, value=num_turns)
+            ws.cell(row=row_idx, column=19, value=round(getattr(r, "duration", 0), 1))
 
             for col_idx in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
 
-        widths = [10, 10, 10, 14, 16, 42, 30, 14, 26, 40, 52, 28, 40, 22, 10, 12, 12, 45, 12, 15, 15, 20, 15, 55]
+        widths = [12, 45, 25, 18, 18, 10, 45, 55, 30, 16, 10, 12, 22, 40, 30, 45, 14, 12, 10]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
 
-    # ---------------- Sheet 2 ----------------
+    # ---------------- Sheet 3 ----------------
+
+    def _create_test_cases_reference_sheet(self, wb: Workbook, results: List[Any]):
+        """Sheet 4: Shows detailed test cases from the Excel for reference."""
+        ws = wb.create_sheet("Test Cases Reference")
+
+        headers = [
+            "Scenario ID",
+            "Scenario Title",
+            "Test Objective",
+            "Expected Response",
+            "Source KB",
+            "Action",
+            "Tool Calling",
+            "Automation Status",
+            "QA Result",
+            "QA Score",
+        ]
+
+        header_fill = PatternFill(start_color="4A148C", end_color="4A148C", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+
+        # Build a lookup from results
+        result_map = {}
+        for r in results:
+            result_map[getattr(r, "test_id", "")] = r
+
+        row_idx = 2
+        for r in results:
+            excel = self._get_excel_meta(r)
+            test_id = getattr(r, "test_id", "")
+
+            # Get raw data which may contain multiple test case rows
+            scenario = getattr(r, "scenario", {}) or {}
+            raw = ((scenario.get("excel", {}) or {}).get("raw", {}) or {})
+            raw_rows = raw.get("rows", []) if isinstance(raw, dict) else []
+
+            if raw_rows and len(raw_rows) > 1:
+                # Multiple test case rows merged — show each
+                for raw_row in raw_rows:
+                    ws.cell(row=row_idx, column=1, value=test_id)
+                    ws.cell(row=row_idx, column=2, value=getattr(r, "test_name", ""))
+
+                    # Extract fields from raw row
+                    obj = ""
+                    exp = ""
+                    src = ""
+                    action = ""
+                    tool = ""
+                    for key, val in raw_row.items():
+                        kl = (key or "").lower().strip()
+                        val_str = str(val).strip() if val else ""
+                        if "objective" in kl or "expected behaviour" in kl:
+                            obj = val_str or obj
+                        if "expected" in kl and "response" in kl:
+                            exp = val_str or exp
+                        if "source" in kl or "kb" in kl:
+                            src = val_str or src
+                        if "action" in kl:
+                            action = val_str or action
+                        if "tool" in kl:
+                            tool = val_str or tool
+
+                    ws.cell(row=row_idx, column=3, value=(obj or excel.get("action", ""))[:2000])
+                    ws.cell(row=row_idx, column=4, value=(exp or excel.get("expected_response", ""))[:3000])
+                    ws.cell(row=row_idx, column=5, value=(src or excel.get("source_kb", ""))[:500])
+                    ws.cell(row=row_idx, column=6, value=(action or excel.get("action", ""))[:1000])
+                    ws.cell(row=row_idx, column=7, value="Y" if excel.get("tool_calling_queries") else "N")
+                    ws.cell(row=row_idx, column=8, value=getattr(r, "execution_mode", ""))
+                    ws.cell(row=row_idx, column=9, value=getattr(r, "display_status", ""))
+                    ws.cell(row=row_idx, column=10, value=getattr(r, "qa_score", ""))
+
+                    for col_idx in range(1, len(headers) + 1):
+                        ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+                    row_idx += 1
+            else:
+                # Single row — just show the scenario
+                ws.cell(row=row_idx, column=1, value=test_id)
+                ws.cell(row=row_idx, column=2, value=getattr(r, "test_name", ""))
+                ws.cell(row=row_idx, column=3, value=(excel.get("action", "") or excel.get("test_objective", ""))[:2000])
+                ws.cell(row=row_idx, column=4, value=(excel.get("expected_response", ""))[:3000])
+                ws.cell(row=row_idx, column=5, value=(excel.get("source_kb", ""))[:500])
+                ws.cell(row=row_idx, column=6, value=(excel.get("action", ""))[:1000])
+                ws.cell(row=row_idx, column=7, value="Y" if excel.get("tool_calling_queries") else "N")
+                ws.cell(row=row_idx, column=8, value=getattr(r, "execution_mode", ""))
+                ws.cell(row=row_idx, column=9, value=getattr(r, "display_status", ""))
+                ws.cell(row=row_idx, column=10, value=getattr(r, "qa_score", ""))
+
+                for col_idx in range(1, len(headers) + 1):
+                    ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+                row_idx += 1
+
+        widths = [12, 45, 50, 55, 30, 35, 12, 18, 14, 10]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ---------------- Sheet 4 ----------------
 
     def _create_failure_evidence_sheet(self, wb: Workbook, results: List[Any]):
-        ws = wb.create_sheet("Failure Evidence")
+        ws = wb.create_sheet("Failure Details")
 
         headers = [
             "Test ID", "Status",

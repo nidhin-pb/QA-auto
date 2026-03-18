@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import app_config
 from websocket_manager import ws_manager
+from structured_ai_simulator import StructuredAISimulator
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
@@ -346,21 +347,33 @@ class AIBrain:
         return bool(self._working_model) and self._working_model.startswith("openai/")
 
     async def generate_initial_message(self, scenario: dict) -> str:
+        """
+        For non-structured (legacy) scenarios only.
+        Use hint directly if it exists.
+        AI rewrite only if hint is empty or very short.
+        """
         await self._test_apis()
         hint = scenario.get("initial_message", "") or ""
-
-        if self._model_ok_for_initial_rewrite() and hint and scenario.get("min_turns", 1) > 1:
+        
+        # If we have a good hint, use it directly (saves tokens)
+        if hint and len(hint.strip()) > 10:
+            return hint
+        
+        # Only call AI if hint is empty/short and AI available
+        if self.is_available() and (not hint or len(hint.strip()) < 10):
             system = (
-                "Rewrite the message with the same meaning. "
-                "Return ONLY the rewritten message. Under 50 words."
+                "You are an employee asking an IT helpdesk bot for help. "
+                "Write a natural message describing your IT issue. "
+                "Return ONLY the message. Under 50 words."
             )
-            prompt = f"Rewrite with same meaning:\n{hint}"
+            goal = scenario.get("goal", "") or scenario.get("name", "")
+            prompt = f"Write a help request message for this goal: {goal}"
             txt = await self._call_bytez_any_model(prompt, system=system, prefer_model=self._working_model)
             if txt and 5 < len(txt) < 200 and not _sounds_like_bot(txt):
                 await ws_manager.send_log("info", f"🤖 AI initial: {txt[:80]}")
                 return txt
-
-        return hint
+        
+        return hint or "I need help with an IT issue."
 
     async def generate_follow_up(self, scenario: dict, history: List[Dict], cva_response: str, goal_status: str) -> str:
         await self._test_apis()
@@ -442,6 +455,64 @@ class AIBrain:
             "has_error": has_error,
             "notes": f"Model: {self._working_model or 'templates'}",
         }
+
+    async def generate_structured_initial_message(self, scenario: dict) -> str:
+        """
+        LLM-assisted initial prompt generation for structured scenarios.
+        Uses LLM only when templates/Excel didn't provide a good prompt.
+        """
+        await self._test_apis()
+
+        existing = (scenario.get("initial_message") or "").strip()
+        
+        # If we already have a good human-like prompt, skip LLM (save tokens)
+        if existing and len(existing) > 10:
+            bad_starts = ["verify ", "validate ", "ensure ", "confirm ", "check whether "]
+            if not any(existing.lower().startswith(x) for x in bad_starts):
+                return existing
+
+        # No good prompt yet — call LLM to generate one
+        if self.is_available():
+            req = StructuredAISimulator.build_initial_prompt_request(scenario)
+            txt = await self._call_bytez_any_model(
+                prompt=req["prompt"],
+                system=req["system"],
+                prefer_model=self._working_model
+            )
+            txt = self._clean_response(txt)
+            if txt and 5 < len(txt) < 300 and not _sounds_like_bot(txt):
+                await ws_manager.send_log("info", f"🤖 AI generated initial: {txt[:100]}")
+                return txt
+
+        return existing or scenario.get("name", "") or "I need help with an IT issue."
+
+    async def generate_structured_follow_up(self, scenario: dict, history: List[Dict], cva_response: str) -> str:
+        """
+        Structured follow-up generation.
+        Templates first (free, fast, reliable), LLM only when templates have nothing.
+        """
+        await self._test_apis()
+
+        # Try deterministic template FIRST (saves tokens, faster)
+        from structured_followup_v2 import StructuredFollowUpV2
+        template_reply = StructuredFollowUpV2.next_user_reply(scenario, history, cva_response)
+        if template_reply and len(template_reply.strip()) > 3:
+            return template_reply
+
+        # Template had nothing — use LLM
+        if self.is_available():
+            req = StructuredAISimulator.build_followup_request(scenario, history, cva_response)
+            txt = await self._call_bytez_any_model(
+                prompt=req["prompt"],
+                system=req["system"],
+                prefer_model=self._working_model
+            )
+            txt = self._clean_response(txt)
+            if txt and 3 < len(txt) < 400 and not _sounds_like_bot(txt):
+                await ws_manager.send_log("info", f"🤖 AI follow-up: {txt[:100]}")
+                return txt
+
+        return ""
 
     def _template_follow_up(self, scenario: dict, history: List[Dict], cva_response: str) -> str:
         """Context-aware template follow-ups that sound like a real employee."""
@@ -588,3 +659,9 @@ Return JSON:
 
     async def close(self):
         pass
+
+
+def _sounds_like_bot(txt: str) -> bool:
+    """Detect if AI response sounds like a bot instead of a user."""
+    low = txt.lower()
+    return any(phrase in low for phrase in BOT_TONE_PHRASES)

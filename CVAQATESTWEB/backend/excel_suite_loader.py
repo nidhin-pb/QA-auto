@@ -3,12 +3,47 @@ import re
 import csv
 from typing import List, Dict, Tuple, Optional
 from openpyxl import load_workbook
+from intent import Intent
 
 
 def _norm_header(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[\s\-_]+", "", s)
     return s
+
+
+def map_intent(action: str, module: str):
+    a = (action or "").lower()
+    m = (module or "").lower()
+
+    if "greeting" in m:
+        return Intent.GREETING
+
+    if "out-of-scope" in m:
+        return Intent.OUT_OF_SCOPE
+
+    if "catalog" in m:
+        return Intent.CATALOG
+
+    if "network" in m:
+        return Intent.TROUBLESHOOT
+
+    if "create" in a:
+        return Intent.CREATE_TICKET
+
+    if "update" in a:
+        return Intent.UPDATE_TICKET
+
+    if "status" in a:
+        return Intent.STATUS_CHECK
+
+    if "close" in a:
+        return Intent.CLOSE_TICKET
+
+    if "reopen" in a:
+        return Intent.REOPEN_TICKET
+
+    return Intent.UNKNOWN
 
 
 def _is_greeting(q: str) -> bool:
@@ -200,6 +235,7 @@ def load_suite_from_bytes(filename: str, raw: bytes) -> Dict:
             "validations": validations,
             "stop_after_first_response": single_turn,
             "response_timeout": response_timeout,
+            "intent": map_intent(action, module),
 
             "excel": {
                 "client": client,

@@ -496,3 +496,29 @@
     right: 8px;
     top: 8px;
 }
+
+.result-card.skipped .count { color: #a0aec0; }
+
+.structured-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+.structured-badge.family {
+    background: #22543d;
+    color: #9ae6b4;
+}
+
+.structured-badge.mode {
+    background: #2a4365;
+    color: #90cdf4;
+}
+
+.structured-badge.warning {
+    background: #744210;
+    color: #f6e05e;
+}

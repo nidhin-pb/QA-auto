@@ -1,53 +1,65 @@
 from validators.base_validator import BaseValidator
+from intent import Intent
+from utils import extract_ticket_number, contains_ticket_confirmation, contains_update_confirmation, contains_close_confirmation, contains_ticket_list
 
 
 class TicketValidator(BaseValidator):
 
     def validate(self, result, conversation):
+        lifecycle = getattr(result, "lifecycle", {}) or {}
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
 
-        action = (result.scenario.get("excel", {}) or {}).get("action", "").lower()
+        intent = lifecycle.get("intent")
+        stage = lifecycle.get("stage")
         bot_reply = (result.actual_first_reply or "").lower()
-        state = getattr(result, "state", {})
+        all_bot = "\n\n".join(
+            [(m.get("content") or "") for m in (result.conversation_log or []) if (m.get("role") or "").lower() in ("assistant", "cva")]
+        )
+        text = all_bot or bot_reply
+        ticket = extract_ticket_number(text)
 
-        failures = []
+        # CREATE
+        if intent == Intent.CREATE_TICKET:
+            if ticket and (stage == "created" or contains_ticket_confirmation(text)):
+                return {"passed": True, "failures": [], "notes": [f"Ticket created/referenced: {ticket}"]}
 
-        # ---- CREATE TICKET FLOW ----
-        if "create" in action:
+            if any(x in bot_reply for x in ["subject", "description", "impact", "urgency", "provide", "before i proceed", "employee id"]):
+                return {"passed": True, "failures": [], "notes": ["Requested ticket details"]}
 
-            # Case 1: Asking for required details (valid first step)
-            if any(x in bot_reply for x in ["provide", "subject", "description", "impact", "urgency", "more details"]):
-                return {"passed": True, "failures": [], "notes": ["Asked for required ticket details"]}
+            if any(x in bot_reply for x in ["existing ticket", "already have an open incident", "would you like to update"]):
+                return {"passed": True, "failures": [], "notes": ["Acceptable alternate: existing ticket offered for update"]}
 
-            # Case 2: Ticket actually created
-            if state.get("ticket_created"):
-                return {"passed": True, "failures": [], "notes": ["Ticket created successfully"]}
+            return {"passed": False, "failures": ["Ticket creation flow incomplete"], "notes": []}
 
-            failures.append("Ticket creation flow not handled correctly")
+        # UPDATE
+        if intent == Intent.UPDATE_TICKET:
+            if stage == "updated" or contains_update_confirmation(text):
+                return {"passed": True, "failures": [], "notes": ["Ticket updated"]}
 
-        # ---- UPDATE FLOW ----
-        if "update" in action:
-
-            # Case 1: Asking for ticket number
-            if "ticket number" in bot_reply:
+            if "ticket number" in bot_reply or "which ticket" in bot_reply:
                 return {"passed": True, "failures": [], "notes": ["Requested ticket number"]}
 
-            # Case 2: Ticket updated
-            if state.get("ticket_updated"):
-                return {"passed": True, "failures": [], "notes": ["Ticket updated successfully"]}
+            return {"passed": False, "failures": ["Ticket update flow incomplete"], "notes": []}
 
-            failures.append("Ticket update flow not handled correctly")
+        # STATUS / QUERY
+        if intent == Intent.STATUS_CHECK:
+            if contains_ticket_list(text) or ticket:
+                return {"passed": True, "failures": [], "notes": ["Ticket details/status shown"]}
 
-        # ---- STATUS FLOW ----
-        if "status" in action:
-            if "status" in bot_reply or "incident" in bot_reply:
-                return {"passed": True, "failures": [], "notes": ["Ticket status handled"]}
+            if "ticket number" in bot_reply:
+                return {"passed": True, "failures": [], "notes": ["Requested ticket identifier"]}
 
-        # ---- CLOSE FLOW ----
-        if "close" in action:
-            if state.get("ticket_closed"):
+            return {"passed": False, "failures": ["Ticket status/query flow incomplete"], "notes": []}
+
+        # CLOSE
+        if intent == Intent.CLOSE_TICKET:
+            if stage == "closed" or contains_close_confirmation(text):
                 return {"passed": True, "failures": [], "notes": ["Ticket closed"]}
 
-        if failures:
-            return {"passed": False, "failures": failures, "notes": []}
+            if any(x in bot_reply for x in ["ticket number", "fully resolved", "resolution summary", "confirm issue"]):
+                return {"passed": True, "failures": [], "notes": ["Requested closure confirmation/details"]}
 
-        return {"passed": True, "failures": [], "notes": ["Ticket validation default pass"]}
+            return {"passed": False, "failures": ["Ticket closure flow incomplete"], "notes": []}
+
+        return {"passed": True, "failures": [], "notes": ["Ticket validation passed"]}

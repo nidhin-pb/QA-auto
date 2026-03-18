@@ -1,27 +1,24 @@
+import re
 from validators.base_validator import BaseValidator
 
 
+def normalize(text):
+    return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
 class CatalogValidator(BaseValidator):
+
     def validate(self, result, conversation):
+
         expected = (result.scenario.get("excel", {}) or {}).get("expected_response", "")
-        bot_reply = (result.actual_first_reply or "").lower()
+        bot_reply = result.actual_first_reply or ""
 
-        missing_items = []
+        expected_items = {normalize(x) for x in expected.split("\n") if x.strip()}
+        returned_items = {normalize(x) for x in bot_reply.split("\n") if x.strip()}
 
-        for line in expected.split("\n"):
-            clean = line.strip()
-            if clean and clean.lower() not in bot_reply:
-                missing_items.append(clean)
+        missing = expected_items - returned_items
 
-        if missing_items:
-            return {
-                "passed": False,
-                "failures": ["Missing expected catalog items: " + ", ".join(missing_items)],
-                "notes": []
-            }
+        if missing:
+            return {"passed": False, "failures": [f"Missing catalog items: {missing}"], "notes": []}
 
-        return {
-            "passed": True,
-            "failures": [],
-            "notes": ["Catalog items validated"]
-        }
+        return {"passed": True, "failures": [], "notes": ["Catalog validated"]}
